@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
+	"github.com/containerd/containerd/snapshots/quota"
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/sirupsen/logrus"
@@ -40,15 +41,21 @@ import (
 // the change set between this snapshot and its parent is stored.
 const upperdirKey = "containerd.io/snapshot/overlay.upperdir"
 
+var backingFs = "<unknown>"
+
 // SnapshotterConfig is used to configure the overlay snapshotter instance
 type SnapshotterConfig struct {
 	asyncRemove   bool
 	upperdirLabel bool
 	mountOptions  []string
+	enableQuota   bool
 }
 
 // Opt is an option to configure the overlay snapshotter
 type Opt func(config *SnapshotterConfig) error
+
+// QuotaSetter allows set quota on multi dir
+type QuotaSetter func(layers []string, bytesize uint64) error
 
 // AsynchronousRemove defers removal of filesystem content until
 // the Cleanup method is called. Removals will make the snapshot
@@ -68,6 +75,12 @@ func WithUpperdirLabel(config *SnapshotterConfig) error {
 	return nil
 }
 
+// WithQuotaSize define the set quota support.
+func WithQuotaSize(config *SnapshotterConfig) error {
+	config.enableQuota = true
+	return nil
+}
+
 // WithMountOptions defines the default mount options used for the overlay mount.
 // NOTE: Options are not applied to bind mounts.
 func WithMountOptions(options []string) Opt {
@@ -83,6 +96,8 @@ type snapshotter struct {
 	asyncRemove   bool
 	upperdirLabel bool
 	options       []string
+
+	quotaSetter QuotaSetter
 }
 
 // NewSnapshotter returns a Snapshotter which uses overlayfs. The overlayfs
@@ -129,10 +144,14 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	if !hasOption(config.mountOptions, "index", false) && supportsIndex() {
 		config.mountOptions = append(config.mountOptions, "index=off")
 	}
-
+	quotasetter, err := tryQuotaSetter(root)
+	if err != nil {
+		return nil, err
+	}
 	return &snapshotter{
 		root:          root,
 		ms:            ms,
+		quotaSetter:   quotasetter,
 		asyncRemove:   config.asyncRemove,
 		upperdirLabel: config.upperdirLabel,
 		options:       config.mountOptions,
@@ -389,7 +408,14 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	var (
 		s        storage.Snapshot
 		td, path string
+		info     snapshots.Info
 	)
+
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return nil, err
+		}
+	}
 
 	defer func() {
 		if err != nil {
@@ -409,7 +435,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 	if err := o.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
 		snapshotDir := filepath.Join(o.root, "snapshots")
-		td, err = o.prepareDirectory(ctx, snapshotDir, kind)
+		td, err = o.prepareDirectory(ctx, snapshotDir, info)
 		if err != nil {
 			return fmt.Errorf("failed to create prepare snapshot dir: %w", err)
 		}
@@ -445,7 +471,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	return o.mounts(s), nil
 }
 
-func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
+func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, info snapshots.Info) (string, error) {
 	td, err := os.MkdirTemp(snapshotDir, "new-")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp dir: %w", err)
@@ -455,9 +481,15 @@ func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		return td, err
 	}
 
-	if kind == snapshots.KindActive {
+	if info.Kind == snapshots.KindActive {
 		if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
 			return td, err
+		}
+		if o.quotaSetter != nil {
+			err = o.quotaSetter([]string{filepath.Join(td, "fs"), filepath.Join(td, "work")})
+			if err != nil {
+				return td, err
+			}
 		}
 	}
 
@@ -539,4 +571,37 @@ func supportsIndex() bool {
 		return true
 	}
 	return false
+}
+
+func tryQuotaSetter(root string) (QuotaSetter, error) {
+
+	fsMagic, err := overlayutils.GetFSMagic(root)
+	if err != nil {
+		logrus.WithError(err).Warnf("get path %v filesystem magic number failed", root)
+		return nil, err
+	}
+
+	//TODO: check kernel version, kernel should be >= v4.5
+	if fsName, ok := overlayutils.FsNames[fsMagic]; ok {
+		backingFs = fsName
+	}
+	logrus.Debugf("path %s, filesystem magic %v", root, backingFs)
+	switch fsMagic {
+	case overlayutils.FsMagicXfs:
+		quotaCtl, err := quota.NewControl(root)
+		if err != nil {
+			logrus.WithError(err).Warnf("could not initinal quota control")
+			return nil, err
+		}
+
+		return func(targets []string, bytesize uint64) error {
+			if bytesize < 0 {
+				return nil
+			}
+			return quotaCtl.SetAllQuota(quota.Size(bytesize), targets...)
+		}, nil
+	default:
+		logrus.WithError(err).Warnf("filesystem %s does not support Project Quota", backingFs)
+		return nil, fmt.Errorf("filesystem %s not support quota set", backingFs)
+	}
 }

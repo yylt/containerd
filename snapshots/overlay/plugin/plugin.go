@@ -35,6 +35,9 @@ type Config struct {
 
 	// MountOptions are options used for the overlay mount (not used on bind mounts)
 	MountOptions []string `toml:"mount_options"`
+
+	// QuotaSize is define the quota of the snapshot writable layer
+	EnableQuota bool `toml:"enable_quota"`
 }
 
 func init() {
@@ -65,6 +68,9 @@ func init() {
 
 			if len(config.MountOptions) > 0 {
 				oOpts = append(oOpts, overlay.WithMountOptions(config.MountOptions))
+			}
+			if config.EnableQuota {
+				oOpts = append(oOpts, overlay.WithQuotaSize)
 			}
 
 			ic.Meta.Exports["root"] = root
