@@ -95,3 +95,7 @@ func checkCopyShimLogError(ctx context.Context, err error) error {
 	}
 	return err
 }
+
+func removeSocketAddr(ctx context.Context, address, id string) {
+	return
+}

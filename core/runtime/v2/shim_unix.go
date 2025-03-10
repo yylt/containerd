@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"time"
 
+	v2shim "github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/fifo"
 	"golang.org/x/sys/unix"
 )
@@ -44,4 +45,16 @@ func checkCopyShimLogError(ctx context.Context, err error) error {
 	default:
 	}
 	return err
+}
+
+func removeSocketAddr(ctx context.Context, address, id string) {
+	removeSocket := func(debug bool) {
+		socket, err := v2shim.SocketAddress(ctx, address, id, debug)
+		if err != nil {
+			return
+		}
+		v2shim.RemoveSocket(socket)
+	}
+	removeSocket(false)
+	removeSocket(true)
 }

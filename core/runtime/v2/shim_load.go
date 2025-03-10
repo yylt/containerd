@@ -237,6 +237,7 @@ func (m *ShimManager) cleanupWorkDirs(ctx context.Context, rootDir string) error
 			if err := os.RemoveAll(path); err != nil {
 				log.G(ctx).WithError(err).Errorf("cleanup working dir %s", path)
 			}
+			removeSocketAddr(ctx, m.containerdAddress, dir)
 		}
 	}
 	return nil
